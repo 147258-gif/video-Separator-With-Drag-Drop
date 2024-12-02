@@ -173,6 +173,4 @@ The Video and Audio Separator Tool is a desktop application built with Python an
 
 ### License
 This project is open-sourced under the MIT License. For more details, refer to the [LICENSE](LICENSE) file.
-```
 
----
