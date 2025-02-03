@@ -4,244 +4,301 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinterdnd2 import TkinterDnD, DND_FILES
 import threading
+import time
+import sys
+import platform
+import winsound
 
 # 全局变量
-log_content = ""  # 用于存储日志信息
+log_content = ""
+is_processing = False
+stop_event = threading.Event()
 
+class ProcessController:
+    def __init__(self):
+        self.process = None
+        self.is_running = False
 
-def run_command(command, use_gpu=False):
-    """
-    执行外部命令，捕获输出，并解决编码问题，同时记录日志
-    """
-    global log_content  # 引用全局变量
+    def terminate(self):
+        if self.process and self.is_running:
+            self.process.terminate()
+            self.is_running = False
+
+controller = ProcessController()
+
+def check_ffmpeg():
+    try:
+        subprocess.run(["ffmpeg", "-version"], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+def run_command(command, use_gpu=False, progress_callback=None):
+    global log_content
     flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+    
     if use_gpu:
-        command.insert(1, "-hwaccel")
-        command.insert(2, "cuda")
+        command[1:1] = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
 
+    controller.is_running = True
     try:
-        result = subprocess.run(
+        controller.process = subprocess.Popen(
             command,
-            check=True,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            encoding="utf-8",  # 强制使用 UTF-8 解码
-            errors="replace",  # 遇到无法解码的字符时进行替换
-            creationflags = flags
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=flags
         )
-        log_content += f"命令：{' '.join(command)}\n输出：{result.stdout}\n错误：{result.stderr}\n\n"
-        return result.stdout, result.stderr
-    except subprocess.CalledProcessError as e:
-        log_content += f"命令：{' '.join(command)}\n失败：{e.stderr}\n\n"
-        return e.stdout, e.stderr
 
+        duration = None
+        for line in controller.process.stdout:
+            if stop_event.is_set():
+                controller.terminate()
+                break
+            
+            if "Duration" in line:
+                duration_str = line.split("Duration:")[1].split(",")[0].strip()
+                h, m, s = duration_str.split(':')
+                duration = int(h)*3600 + int(m)*60 + float(s)
+            
+            if "time=" in line and duration:
+                time_str = line.split("time=")[1].split(" ")[0]
+                h, m, s = time_str.split(':')
+                current_time = int(h)*3600 + int(m)*60 + float(s)
+                progress = (current_time / duration) * 100
+                if progress_callback:
+                    progress_callback(min(progress, 100))
 
-def separate_audio_video(input_file, output_audio, output_video, progress_var, progress_bar, start_button,
-                         selected_audio_format, selected_video_format, use_gpu):
-    """
-    分离音频和视频流，并处理 GPU 模式，同时记录日志
-    """
-    global log_content  # 引用全局变量
-    try:
-        start_button.config(text="正在分离", state=tk.DISABLED)
-
-        # 更新进度条（分离音频）
-        progress_var.set(0)
-        progress_bar.update()
-
-        # 分离音频
-        if selected_audio_format != "不分离音频":
-            audio_command = ["ffmpeg", "-i", input_file, "-vn", "-acodec", "libmp3lame", output_audio]
-            run_command(audio_command, use_gpu)
-
-        # 更新进度条（分离视频）
-        progress_var.set(50)
-        progress_bar.update()
-
-        # 分离视频
-        if selected_video_format != "不分离视频":
-            video_command = ["ffmpeg", "-i", input_file, "-an", "-vcodec", "copy", output_video]
-            run_command(video_command, use_gpu)
-
-        progress_var.set(100)
-        progress_bar.update()
-
-        messagebox.showinfo("成功", f"分离完成！\n音频：{output_audio}\n视频：{output_video}")
+        controller.process.wait()
+        if controller.process.returncode == 0:
+            log_content += f"成功：{' '.join(command)}\n"
+        else:
+            log_content += f"失败：{' '.join(command)}\n"
 
     except Exception as e:
-        log_content += f"错误：{str(e)}\n\n"
-        messagebox.showerror("错误", f"处理时出错：{str(e)}")
+        log_content += f"错误：{str(e)}\n"
     finally:
-        start_button.config(text="开始分离", state=tk.NORMAL)
+        controller.is_running = False
 
+def separate_streams(input_files, output_dir, audio_format, video_format, use_gpu, progress_var, progress_label):
+    global is_processing
+    is_processing = True
+    total_files = len(input_files)
+    
+    for idx, file in enumerate(input_files):
+        if stop_event.is_set():
+            break
+            
+        base_name = os.path.splitext(os.path.basename(file))[0]
+        output_audio = os.path.join(output_dir, f"{base_name}_audio.{audio_format.lower()}")
+        output_video = os.path.join(output_dir, f"{base_name}_video.{video_format.lower()}")
 
-def browse_file():
-    """
-    打开文件选择对话框
-    """
-    file_path = filedialog.askopenfilename(filetypes=[("视频文件", "*.mp4;*.mkv;*.avi")])
-    if file_path:
-        input_file_var.set(file_path)
+        try:
+            # 音频处理
+            if audio_format != "不分离音频":
+                audio_cmd = ["ffmpeg", "-i", file, "-vn"]
+                if audio_format == "MP3":
+                    audio_cmd += ["-acodec", "libmp3lame", "-q:a", "2"]
+                elif audio_format == "WAV":
+                    audio_cmd += ["-acodec", "pcm_s16le"]
+                audio_cmd += [output_audio]
+                
+                run_command(audio_cmd, use_gpu, 
+                           lambda p: progress_var.set(p * 0.5 * (idx+1)/total_files))
 
+            # 视频处理
+            if video_format != "不分离视频":
+                video_cmd = ["ffmpeg", "-i", file, "-an", "-vcodec", "copy", output_video]
+                run_command(video_cmd, use_gpu,
+                           lambda p: progress_var.set((50 + p * 0.5) * (idx+1)/total_files))
+
+        except Exception as e:
+            log_content += f"文件 {file} 处理失败：{str(e)}\n"
+
+    if not stop_event.is_set():
+        play_sound()
+        if platform.system() == 'Windows':
+            os.startfile(output_dir)
+        elif platform.system() == 'Darwin':
+            subprocess.Popen(['open', output_dir])
+        else:
+            subprocess.Popen(['xdg-open', output_dir])
+    
+    is_processing = False
+    stop_event.clear()
+
+def play_sound():
+    if platform.system() == 'Windows':
+        winsound.MessageBeep()
+    else:
+        print('\a')
+
+def browse_output():
+    path = filedialog.askdirectory()
+    if path:
+        output_dir_var.set(path)
+
+def validate_files(file_list):
+    valid_extensions = ('.mp4', '.mkv', '.avi', '.mov')
+    return [f for f in file_list if f.lower().endswith(valid_extensions)]
 
 def start_processing():
-    """
-    开始处理任务
-    """
-    input_file = input_file_var.get()
-    if not input_file:
-        messagebox.showwarning("警告", "请选择一个输入文件！")
+    if not check_ffmpeg():
+        messagebox.showerror("错误", "未找到ffmpeg，请先安装并添加到环境变量！")
         return
 
-    selected_audio_format = audio_format_var.get()
-    selected_video_format = video_format_var.get()
-    use_gpu = gpu_var.get() == "使用 GPU"
+    input_files = input_file_var.get().split(';') if ';' in input_file_var.get() else [input_file_var.get()]
+    input_files = validate_files(input_files)
+    
+    if not input_files:
+        messagebox.showwarning("警告", "请选择有效的视频文件！")
+        return
 
-    if selected_audio_format == "不分离音频" and selected_video_format == "不分离视频":
+    output_dir = output_dir_var.get() or os.path.dirname(input_files[0])
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    selected_audio = audio_format_var.get()
+    selected_video = video_format_var.get()
+    
+    if selected_audio == "不分离音频" and selected_video == "不分离视频":
         messagebox.showwarning("警告", "请选择至少分离音频或视频！")
         return
 
-    output_audio = os.path.splitext(input_file)[0] + "_audio." + selected_audio_format.lower()
-    output_video = os.path.splitext(input_file)[0] + "_video." + selected_video_format.lower()
-
     progress_var.set(0)
-    progress_bar.update()
-
-    thread = threading.Thread(target=separate_audio_video, args=(
-        input_file, output_audio, output_video, progress_var, progress_bar, start_button,
-        selected_audio_format, selected_video_format, use_gpu
+    thread = threading.Thread(target=separate_streams, args=(
+        input_files, output_dir, selected_audio, selected_video,
+        gpu_var.get() == "使用 GPU", progress_var, progress_label
     ))
     thread.start()
 
-
-def center_window(window, width, height):
-    """
-    将窗口居中显示
-    """
-    screen_width = window.winfo_screenwidth()
-    screen_height = window.winfo_screenheight()
-
-    position_top = int(screen_height / 2 - height / 2)
-    position_right = int(screen_width / 2 - width / 2)
-
-    window.geometry(f'{width}x{height}+{position_right}+{position_top}')
-
-
-def on_drop(event):
-    """
-    处理文件拖放事件
-    """
-    file_path = event.data
-    if file_path.endswith(('.mp4', '.mkv', '.avi')):  # 只允许视频文件
-        input_file_var.set(file_path)
-    else:
-        messagebox.showwarning("无效文件", "请拖入一个有效的视频文件！")
-
-
-def show_author_info():
-    """
-    显示作者信息
-    """
-    author_info = "作者: Leo Zivika\n开源地址: https://github.com/147258-gif/video_separator_with_drag_drop"
-    messagebox.showinfo("作者信息", author_info)
-
+def cancel_processing():
+    stop_event.set()
+    controller.terminate()
+    progress_var.set(0)
+    progress_label.config(text="已取消")
 
 def show_log_window():
-    """
-    显示日志的独立窗口
-    """
+    """显示日志的独立窗口"""
+    global log_content
+    
     if not log_content.strip():
         messagebox.showinfo("日志", "暂无日志内容！")
         return
 
     log_window = tk.Toplevel(root)
     log_window.title("日志信息")
-    log_window.geometry("600x400")
+    log_window.geometry("800x600")
 
-    text_area = tk.Text(log_window, wrap="word", font=("Arial", 10))
+    text_frame = ttk.Frame(log_window)
+    text_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+    text_area = tk.Text(text_frame, wrap="word", font=("Consolas", 10))
     text_area.insert("1.0", log_content)
     text_area.config(state="disabled")
-    text_area.pack(expand=True, fill="both")
+    text_area.pack(side="left", fill="both", expand=True)
 
-    scrollbar = ttk.Scrollbar(log_window, orient="vertical", command=text_area.yview)
-    text_area.config(yscrollcommand=scrollbar.set)
+    scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=text_area.yview)
     scrollbar.pack(side="right", fill="y")
+    text_area.config(yscrollcommand=scrollbar.set)
 
+    clear_button = ttk.Button(log_window, text="清除日志", 
+                            command=lambda: clear_log(text_area))
+    clear_button.pack(pady=5)
 
-# 创建主窗口
+def clear_log(text_widget):
+    """清除日志内容"""
+    global log_content
+    log_content = ""
+    text_widget.config(state="normal")
+    text_widget.delete("1.0", "end")
+    text_widget.config(state="disabled")
+
+def show_author_info():
+    """显示作者信息"""
+    author_info = "作者: Leo Zivika\n开源地址: https://github.com/147258-gif/video_separator_with_drag_drop"
+    messagebox.showinfo("作者信息", author_info)
+
+def on_drop(event):
+    files = event.data.split(';') if ';' in event.data else [event.data]
+    valid_files = validate_files(files)
+    if valid_files:
+        input_file_var.set(';'.join(valid_files))
+    else:
+        messagebox.showwarning("无效文件", "仅支持以下格式：\n.mp4, .mkv, .avi, .mov")
+
+# GUI界面
 root = TkinterDnD.Tk()
-root.title("音视频分离工具")
+root.title("增强版音视频分离工具")
 
-# 设置窗口大小和居中
-window_width = 700
-window_height = 500
-center_window(root, window_width, window_height)
+# 样式配置
+style = ttk.Style()
+style.configure('TCombobox', padding=5)
+style.configure('TButton', padding=5)
+style.map('TButton', background=[('active', '#45a049')])
 
-# 设置背景颜色
-root.config(bg="#f2f2f2")
+# 布局框架
+main_frame = ttk.Frame(root, padding=20)
+main_frame.pack(fill='both', expand=True)
 
-# 输入文件选择
+# 输入文件部分
+ttk.Label(main_frame, text="输入文件:").grid(row=0, column=0, sticky='w')
 input_file_var = tk.StringVar()
-tk.Label(root, text="选择输入文件：", font=("Arial", 12), bg="#f2f2f2").grid(row=0, column=0, padx=20, pady=10,
-                                                                            sticky="w")
-tk.Entry(root, textvariable=input_file_var, width=40, font=("Arial", 12), relief="solid").grid(row=0, column=1, padx=20,
-                                                                                               pady=10)
-tk.Button(root, text="浏览...", command=browse_file, bg="#4CAF50", fg="white", font=("Arial", 12), relief="flat").grid(
-    row=0, column=2, padx=20, pady=10)
+ttk.Entry(main_frame, textvariable=input_file_var, width=50).grid(row=0, column=1)
+ttk.Button(main_frame, text="添加文件", command=lambda: input_file_var.set(
+    ';'.join(filedialog.askopenfilenames(filetypes=[("视频文件", "*.mp4;*.mkv;*.avi;*.mov")]))
+)).grid(row=0, column=2)
 
-# 设置拖放事件
-root.drop_target_register(DND_FILES)
-root.dnd_bind('<<Drop>>', on_drop)
+# 输出目录部分
+ttk.Label(main_frame, text="输出目录:").grid(row=1, column=0, sticky='w')
+output_dir_var = tk.StringVar()
+ttk.Entry(main_frame, textvariable=output_dir_var, width=50).grid(row=1, column=1)
+ttk.Button(main_frame, text="浏览...", command=browse_output).grid(row=1, column=2)
 
-# 拖拽提示标签
-drag_drop_label = tk.Label(root, text="或将视频文件拖拽到这里", font=("Arial", 12, "italic"), fg="gray", bg="#f2f2f2")
-drag_drop_label.grid(row=1, column=0, columnspan=3, pady=10)
-
-# 音频格式选择
-tk.Label(root, text="选择音频格式：", font=("Arial", 12), bg="#f2f2f2").grid(row=2, column=0, padx=20, pady=10,
-                                                                            sticky="w")
+# 格式选择
+ttk.Label(main_frame, text="音频格式:").grid(row=2, column=0, sticky='w')
 audio_format_var = tk.StringVar(value="MP3")
-audio_format_options = ["MP3", "WAV", "AAC", "不分离音频"]
-audio_format_menu = ttk.Combobox(root, textvariable=audio_format_var, values=audio_format_options, state="readonly",
-                                 font=("Arial", 12))
-audio_format_menu.grid(row=2, column=1, padx=20, pady=10, sticky="w")
+ttk.Combobox(main_frame, textvariable=audio_format_var, 
+            values=["MP3", "WAV", "AAC", "不分离音频"], state="readonly").grid(row=2, column=1, sticky='w')
 
-# 视频格式选择
-tk.Label(root, text="选择视频格式：", font=("Arial", 12), bg="#f2f2f2").grid(row=3, column=0, padx=20, pady=10,
-                                                                            sticky="w")
+ttk.Label(main_frame, text="视频格式:").grid(row=3, column=0, sticky='w')
 video_format_var = tk.StringVar(value="MP4")
-video_format_options = ["MP4", "MKV", "AVI", "不分离视频"]
-video_format_menu = ttk.Combobox(root, textvariable=video_format_var, values=video_format_options, state="readonly",
-                                 font=("Arial", 12))
-video_format_menu.grid(row=3, column=1, padx=20, pady=10, sticky="w")
+ttk.Combobox(main_frame, textvariable=video_format_var, 
+            values=["MP4", "MKV", "AVI", "不分离视频"], state="readonly").grid(row=3, column=1, sticky='w')
 
-# GPU 选择
-tk.Label(root, text="选择运行模式：", font=("Arial", 12), bg="#f2f2f2").grid(row=4, column=0, padx=20, pady=10,
-                                                                            sticky="w")
+# GPU选择
+ttk.Label(main_frame, text="硬件加速:").grid(row=4, column=0, sticky='w')
 gpu_var = tk.StringVar(value="使用 CPU")
-gpu_options = ["使用 CPU", "使用 GPU"]
-gpu_menu = ttk.Combobox(root, textvariable=gpu_var, values=gpu_options, state="readonly", font=("Arial", 12))
-gpu_menu.grid(row=4, column=1, padx=20, pady=10, sticky="w")
+ttk.Combobox(main_frame, textvariable=gpu_var, 
+            values=["使用 CPU", "使用 GPU"], state="readonly").grid(row=4, column=1, sticky='w')
 
 # 进度条
 progress_var = tk.DoubleVar()
-progress_bar = ttk.Progressbar(root, variable=progress_var, maximum=100)
-progress_bar.grid(row=5, column=0, columnspan=3, pady=20, sticky="ew", padx=20)
+progress_bar = ttk.Progressbar(main_frame, variable=progress_var, maximum=100)
+progress_bar.grid(row=5, column=0, columnspan=3, pady=10, sticky='ew')
 
-# 开始分离按钮
-start_button = tk.Button(root, text="开始分离", command=start_processing, bg="#2196F3", fg="white", font=("Arial", 14),
-                         relief="flat")
-start_button.grid(row=6, column=0, columnspan=3, pady=10)
+progress_label = ttk.Label(main_frame, text="准备就绪")
+progress_label.grid(row=6, column=0, columnspan=3)
 
-# 查看日志按钮
-log_button = tk.Button(root, text="查看日志", command=show_log_window, bg="#FFC107", fg="black", font=("Arial", 12),
-                       relief="flat")
-log_button.grid(row=7, column=0, columnspan=3, pady=10)
+# 按钮组
+btn_frame = ttk.Frame(main_frame)
+btn_frame.grid(row=7, column=0, columnspan=3, pady=10)
 
-# 作者信息按钮
-author_button = tk.Button(root, text="作者信息", command=show_author_info, bg="#795548", fg="white", font=("Arial", 12),
-                          relief="flat")
-author_button.grid(row=8, column=0, columnspan=3, pady=10)
+ttk.Button(btn_frame, text="开始处理", command=start_processing).pack(side='left', padx=5)
+ttk.Button(btn_frame, text="停止处理", command=cancel_processing).pack(side='left', padx=5)
+ttk.Button(btn_frame, text="查看日志", command=show_log_window).pack(side='left', padx=5)
+ttk.Button(btn_frame, text="作者信息", command=show_author_info).pack(side='left', padx=5)
 
-# 主循环
+# 拖放功能
+root.drop_target_register(DND_FILES)
+root.dnd_bind('<<Drop>>', on_drop)
+
+# 初始化检查
+if not check_ffmpeg():
+    messagebox.showerror("环境错误", "未检测到FFmpeg，请先安装！")
+    sys.exit()
+
 root.mainloop()
