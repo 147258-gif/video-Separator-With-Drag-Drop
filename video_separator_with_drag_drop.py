@@ -7,7 +7,7 @@ import threading
 import time
 import sys
 import platform
-import winsound  # Windows系统提示音
+import winsound
 
 # 全局变量
 log_content = ""
@@ -181,6 +181,47 @@ def cancel_processing():
     progress_var.set(0)
     progress_label.config(text="已取消")
 
+def show_log_window():
+    """显示日志的独立窗口"""
+    global log_content
+    
+    if not log_content.strip():
+        messagebox.showinfo("日志", "暂无日志内容！")
+        return
+
+    log_window = tk.Toplevel(root)
+    log_window.title("日志信息")
+    log_window.geometry("800x600")
+
+    text_frame = ttk.Frame(log_window)
+    text_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+    text_area = tk.Text(text_frame, wrap="word", font=("Consolas", 10))
+    text_area.insert("1.0", log_content)
+    text_area.config(state="disabled")
+    text_area.pack(side="left", fill="both", expand=True)
+
+    scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=text_area.yview)
+    scrollbar.pack(side="right", fill="y")
+    text_area.config(yscrollcommand=scrollbar.set)
+
+    clear_button = ttk.Button(log_window, text="清除日志", 
+                            command=lambda: clear_log(text_area))
+    clear_button.pack(pady=5)
+
+def clear_log(text_widget):
+    """清除日志内容"""
+    global log_content
+    log_content = ""
+    text_widget.config(state="normal")
+    text_widget.delete("1.0", "end")
+    text_widget.config(state="disabled")
+
+def show_author_info():
+    """显示作者信息"""
+    author_info = "作者: Leo Zivika\n开源地址: https://github.com/147258-gif/video_separator_with_drag_drop"
+    messagebox.showinfo("作者信息", author_info)
+
 def on_drop(event):
     files = event.data.split(';') if ';' in event.data else [event.data]
     valid_files = validate_files(files)
@@ -189,7 +230,7 @@ def on_drop(event):
     else:
         messagebox.showwarning("无效文件", "仅支持以下格式：\n.mp4, .mkv, .avi, .mov")
 
-# GUI界面更新
+# GUI界面
 root = TkinterDnD.Tk()
 root.title("增强版音视频分离工具")
 
